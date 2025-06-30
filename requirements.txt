@@ -1,7 +1,41 @@
+# Web Framework and API
 fastapi==0.104.1
 uvicorn==0.24.0
 pydantic==2.5.1
 python-multipart==0.0.6
-pytz==2023.3
 gunicorn==21.2.0
-python-dotenv==1.0.0 
+
+# Date and Time
+pytz==2023.3
+
+# Environment Variables
+python-dotenv==1.0.0
+
+# WebSocket and HTTP
+websocket-client>=1.8.0,<2.0.0
+urllib3>=2.0.0
+niquests>=3.14.0
+certifi>=2025.1.31
+
+# HTML Parsing
+beautifulsoup4>=4.13.3,<5.0.0
+
+# Display and Formatting
+pyfiglet>=1.0.2,<2.0.0
+
+# Scientific Computing
+numpy>=2.2.3,<3.0.0
+
+# Browser Automation
+playwright>=1.44.0
+playwright-stealth>=1.0.6,<2.0.0
+
+# SSL/TLS
+pyOpenSSL>=23.0.0
+
+# Configuration
+configparser>=6.0.0
+
+# Testing and Development
+pytest>=8.0.0
+pytest-asyncio>=0.23.0 
