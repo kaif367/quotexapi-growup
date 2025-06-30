@@ -39,10 +39,10 @@ class WebsocketClient(object):
             # Get Cloudflare tokens
             tokens = self.scraper.get(domain).cookies.get_dict()
             
-            self.headers = {
-                "User-Agent": self.api.session_data.get("user_agent"),
+        self.headers = {
+            "User-Agent": self.api.session_data.get("user_agent"),
                 "Origin": domain,
-                "Host": f"ws2.{self.api.host}",
+            "Host": f"ws2.{self.api.host}",
                 "Cookie": "; ".join([f"{k}={v}" for k, v in tokens.items()]),
             }
             logger.debug("Prepared headers with Cloudflare tokens")
@@ -54,7 +54,7 @@ class WebsocketClient(object):
         """Connect to Quotex WebSocket."""
         self._prepare_headers()
         logger.debug("Initiating WebSocket connection")
-        
+
         websocket.enableTrace(self.api.trace_ws)
         self.websocket_client = websocket.WebSocketApp(
             self.api.wss_url,
