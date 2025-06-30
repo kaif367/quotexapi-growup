@@ -3,6 +3,10 @@ import json
 import time
 import logging
 import websocket
+import threading
+from typing import Dict, List, Optional, Union, Callable
+import cloudscraper
+from urllib.parse import urlparse
 from .. import global_value
 
 logger = logging.getLogger(__name__)
@@ -15,34 +19,93 @@ class WebsocketClient(object):
         """
         :param api: The instance of :class:`QuotexAPI
             <quotexapi.api.QuotexAPI>`.
-        trace_ws: Enables and disable `enableTrace` in WebSocket Client.
         """
         self.api = api
-        self.headers = {
-            "User-Agent": self.api.session_data.get("user_agent"),
-            "Origin": self.api.https_url,
-            "Host": f"ws2.{self.api.host}",
-        }
+        self.websocket_client: Optional[websocket.WebSocketApp] = None
+        self.websocket_thread: Optional[threading.Thread] = None
+        self.reconnect_count = 0
+        self.max_reconnects = 5
+        self.connected = threading.Event()
+        self.headers = {}
+        self.scraper = cloudscraper.create_scraper()
 
+    def _prepare_headers(self):
+        """Prepare headers with Cloudflare tokens"""
+        try:
+            # Get the domain from the WebSocket URL
+            parsed = urlparse(self.api.wss_url)
+            domain = f"https://{parsed.netloc}"
+            
+            # Get Cloudflare tokens
+            tokens = self.scraper.get(domain).cookies.get_dict()
+            
+            self.headers = {
+                "User-Agent": self.api.session_data.get("user_agent"),
+                "Origin": domain,
+                "Host": f"ws2.{self.api.host}",
+                "Cookie": "; ".join([f"{k}={v}" for k, v in tokens.items()]),
+            }
+            logger.debug("Prepared headers with Cloudflare tokens")
+        except Exception as e:
+            logger.error(f"Error preparing headers: {str(e)}")
+            raise
+
+    def connect(self):
+        """Connect to Quotex WebSocket."""
+        self._prepare_headers()
+        logger.debug("Initiating WebSocket connection")
+        
         websocket.enableTrace(self.api.trace_ws)
-        self.wss = websocket.WebSocketApp(
+        self.websocket_client = websocket.WebSocketApp(
             self.api.wss_url,
+            header=self.headers,
             on_message=self.on_message,
             on_error=self.on_error,
             on_close=self.on_close,
-            on_open=self.on_open,
-            on_ping=self.on_ping,
-            on_pong=self.on_pong,
-            header=self.headers,
-            # cookie=self.api.cookies
+            on_open=self.on_open
         )
 
-    def on_message(self, wss, message):
-        """Method to process websocket messages."""
+        self.websocket_thread = threading.Thread(
+            target=self.websocket_client.run_forever,
+            kwargs={
+                'ping_interval': 30,
+                'ping_timeout': 10,
+                'ping_payload': 'ping',
+                'skip_utf8_validation': True
+            }
+        )
+        self.websocket_thread.daemon = True
+        self.websocket_thread.start()
+        
+        # Wait for connection or timeout
+        if not self.connected.wait(timeout=30):
+            logger.error("WebSocket connection timeout")
+            self.reconnect()
+            return False
+        
+        return True
+
+    def reconnect(self):
+        """Reconnect to Quotex WebSocket."""
+        if self.reconnect_count >= self.max_reconnects:
+            logger.error("Max reconnection attempts reached")
+            return False
+            
+        self.reconnect_count += 1
+        logger.info(f"Attempting reconnection {self.reconnect_count}/{self.max_reconnects}")
+        
+        if self.websocket_client:
+            self.websocket_client.close()
+            
+        time.sleep(min(self.reconnect_count * 2, 10))  # Exponential backoff
+        return self.connect()
+
+    def on_message(self, ws, message):
+        """Called when message received from Quotex WebSocket."""
         global_value.ssl_Mutual_exclusion = True
         current_time = time.localtime()
         if current_time.tm_sec in [0, 5, 10, 15, 20, 30, 40, 50]:
-            self.wss.send('42["tick"]')
+            self.websocket_client.send('42["tick"]')
         try:
             if "authorization/reject" in str(message):
                 print("Token rejected, making automatic reconnection.")
@@ -55,9 +118,9 @@ class WebsocketClient(object):
                 global_value.started_listen_instruments = True
 
             try:
-                message = message[1:].decode()
-                logger.debug(message)
-                message = json.loads(message)
+                logger.debug(f"Received message: {message[:200]}...")  # Log truncated message
+                decoded_message = message.decode('utf-8')
+                message = json.loads(decoded_message)
                 self.api.wss_message = message
                 if "call" in str(message) or 'put' in str(message):
                     self.api.instruments = message
@@ -151,38 +214,61 @@ class WebsocketClient(object):
                         }
                     }
                     self.api.realtime_sentiment[i[0]] = result
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error processing message: {str(e)}")
         global_value.ssl_Mutual_exclusion = False
 
-    def on_error(self, wss, error):
-        """Method to process websocket errors."""
-        logger.error(error)
-        global_value.websocket_error_reason = str(error)
-        global_value.check_websocket_if_error = True
+    def on_error(self, ws, error):
+        """Called when error occurred from Quotex WebSocket."""
+        if isinstance(error, websocket.WebSocketBadStatusException):
+            if error.status_code == 403:
+                logger.error(f"Cloudflare protection triggered: {error}")
+                self._prepare_headers()  # Refresh Cloudflare tokens
+            else:
+                logger.error(f"WebSocket error: {error}")
+        else:
+            logger.error(f"WebSocket error: {error}")
+        
+        self.connected.clear()
+        self.reconnect()
 
-    def on_open(self, wss):
-        """Method to process websocket open."""
-        logger.info("Websocket client connected.")
-        global_value.check_websocket_if_connect = 1
+    def on_open(self, ws):
+        """Called when Quotex WebSocket connection opened."""
+        logger.info("WebSocket connection established")
+        self.reconnect_count = 0
+        self.connected.set()
         asset_name = self.api.current_asset
         period = self.api.current_period
-        self.wss.send('42["tick"]')
-        self.wss.send('42["indicator/list"]')
-        self.wss.send('42["drawing/load"]')
-        self.wss.send('42["pending/list"]')
-        self.wss.send('42["instruments/update",{"asset":"%s","period":%d}]' % (asset_name, period))
-        self.wss.send('42["depth/follow","%s"]' % asset_name)
-        self.wss.send('42["chart_notification/get"]')
-        self.wss.send('42["tick"]')
+        self.websocket_client.send('42["tick"]')
+        self.websocket_client.send('42["indicator/list"]')
+        self.websocket_client.send('42["drawing/load"]')
+        self.websocket_client.send('42["pending/list"]')
+        self.websocket_client.send('42["instruments/update",{"asset":"%s","period":%d}]' % (asset_name, period))
+        self.websocket_client.send('42["depth/follow","%s"]' % asset_name)
+        self.websocket_client.send('42["chart_notification/get"]')
+        self.websocket_client.send('42["tick"]')
 
-    def on_close(self, wss, close_status_code, close_msg):
-        """Method to process websocket close."""
-        logger.info("Websocket connection closed.")
-        global_value.check_websocket_if_connect = 0
+    def on_close(self, ws, close_status_code, close_msg):
+        """Called when Quotex WebSocket connection closed."""
+        logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
+        self.connected.clear()
+        if close_status_code != 1000:  # Not a normal closure
+            self.reconnect()
 
-    def on_ping(self, wss, ping_msg):
-        pass
-
-    def on_pong(self, wss, pong_msg):
-        self.wss.send("2")
+    def send(self, data):
+        """Send data to Quotex WebSocket server.
+        
+        :param data: The instance of :class:`websocket.WebSocket`.
+        """
+        try:
+            if not self.websocket_client or not self.websocket_client.sock:
+                logger.warning("WebSocket not connected, attempting reconnection")
+                if not self.reconnect():
+                    raise Exception("Failed to reconnect WebSocket")
+                    
+            self.websocket_client.send(data)
+            logger.debug(f"Sent data: {data[:200]}...")  # Log truncated data
+            
+        except Exception as e:
+            logger.error(f"Error sending data: {str(e)}")
+            self.reconnect()
