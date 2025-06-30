@@ -3,6 +3,7 @@ import sys
 import json
 import configparser
 from pathlib import Path
+from typing import Union
 
 USER_AGENT = "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/119.0"
 
@@ -34,7 +35,7 @@ def credentials():
     return email, password
 
 
-def resource_path(relative_path: str | Path) -> Path:
+def resource_path(relative_path: Union[str, Path]) -> Path:
     global base_dir
     """Get absolute path to resource, works for dev and for PyInstaller"""
     if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
