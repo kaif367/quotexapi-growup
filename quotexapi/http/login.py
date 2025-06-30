@@ -62,7 +62,7 @@ class Login(Browser):
             data["code"] = code
         except KeyboardInterrupt:
             print("\nClosing program.")
-            sys.exit()
+            raise Exception("Login interrupted by user")
 
         await asyncio.sleep(1)
         self.send_request(
@@ -161,12 +161,11 @@ class Login(Browser):
             "email": username,
             "password": password,
             "remember": 1,
-
         }
         status, msg = await self._post(data)
         if not status:
             print(msg)
-            exit(0)
+            raise Exception(f"Login failed: {msg}")
 
         self.get_profile()
 
