@@ -2,9 +2,12 @@ import re
 import json
 import sys
 import asyncio
+import logging
 from pathlib import Path
 from quotexapi.http.navigator import Browser
 
+# Configure logging
+logger = logging.getLogger(__name__)
 
 class Login(Browser):
     """Class for Quotex login resource."""
@@ -21,8 +24,10 @@ class Login(Browser):
         self.html = None
         self.headers = self.get_headers()
         self.full_url = f"{self.https_base_url}/{api.lang}"
+        logger.debug(f"Login initialized with URL: {self.full_url}")
 
     def get_token(self):
+        logger.debug("Getting login token")
         self.headers["Connection"] = "keep-alive"
         self.headers["Accept-Encoding"] = "gzip, deflate, br"
         self.headers["Accept-Language"] = "pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3"
@@ -39,6 +44,8 @@ class Login(Browser):
         self.headers["Sec-Fetch-Dest"] = "document"
         self.headers["Sec-Fetch-Mode"] = "navigate"
         self.headers["Dnt"] = "1"
+
+        logger.debug("Sending request for login token")
         self.send_request(
             "GET",
             f"{self.full_url}/sign-in/modal/"
@@ -48,23 +55,29 @@ class Login(Browser):
             "input", {"name": "_token"}
         )
         token = None if not match else match.get("value")
+        logger.debug(f"Login token obtained: {'Yes' if token else 'No'}")
         return token
 
     async def awaiting_pin(self, data, input_message):
+        logger.debug("PIN verification required")
         self.headers["Content-Type"] = "application/x-www-form-urlencoded"
         self.headers["Referer"] = f"{self.full_url}/sign-in/modal"
         data["keep_code"] = 1
         try:
             code = input(input_message)
             if not code.isdigit():
+                logger.warning("Invalid PIN format entered")
                 print("Please enter a valid code.")
                 await self.awaiting_pin(data, input_message)
             data["code"] = code
+            logger.debug("PIN entered successfully")
         except KeyboardInterrupt:
+            logger.warning("PIN entry interrupted by user")
             print("\nClosing program.")
             raise Exception("Login interrupted by user")
 
         await asyncio.sleep(1)
+        logger.debug("Sending PIN verification request")
         self.send_request(
             method="POST",
             url=f"{self.full_url}/sign-in/modal",
@@ -72,11 +85,13 @@ class Login(Browser):
         )
 
     def get_profile(self):
+        logger.debug("Fetching user profile")
         self.response = self.send_request(
             method="GET",
             url=f"{self.full_url}/trade"
         )
         if self.response:
+            logger.debug("Profile request successful")
             script = self.get_soup().find_all(
                 "script",
                 {"type": "text/javascript"}
@@ -89,9 +104,13 @@ class Login(Browser):
             )
             self.cookies = self.get_cookies()
             self.ssid = json.loads(match).get("token")
+            
+            logger.debug(f"Profile data obtained - SSID: {'Present' if self.ssid else 'Missing'}")
+            
             self.api.session_data["cookies"] = self.cookies
             self.api.session_data["token"] = self.ssid
             self.api.session_data["user_agent"] = self.headers["User-Agent"]
+            
             output_file = Path(f"{self.api.resource_path}/session.json")
             output_file.parent.mkdir(exist_ok=True, parents=True)
             output_file.write_text(
@@ -101,20 +120,22 @@ class Login(Browser):
                     "user_agent": self.headers["User-Agent"]
                 }, indent=4)
             )
+            logger.debug("Session data saved successfully")
             return self.response, json.loads(match)
 
+        logger.warning("Failed to get profile data")
         return None, None
 
     def _get(self):
+        logger.debug("Sending GET request to trade page")
         return self.send_request(
             method="GET",
             url=f"f{self.full_url}/trade"
         )
 
     async def _post(self, data):
-        """Send get request for Quotex API login http resource.
-        :returns: The instance of :class:`requests.Response`.
-        """
+        """Send get request for Quotex API login http resource."""
+        logger.debug("Sending login POST request")
         self.response = self.send_request(
             method="POST",
             url=f"{self.full_url}/sign-in/",
@@ -124,6 +145,7 @@ class Login(Browser):
             "input", {"name": "keep_code"}
         )
         if required_keep_code:
+            logger.info("2FA verification required")
             auth_body = self.get_soup().find(
                 "main", {"class": "auth__body"}
             )
@@ -135,10 +157,12 @@ class Login(Browser):
             await self.awaiting_pin(data, input_message)
         await asyncio.sleep(1)
         success = self.success_login()
+        logger.debug(f"Login attempt result: {'Success' if success[0] else 'Failed'}")
         return success
 
     def success_login(self):
         if "trade" in self.response.url:
+            logger.info("Login successful")
             return True, "Login successful."
         html = self.get_soup()
         match = html.find(
@@ -147,26 +171,25 @@ class Login(Browser):
             "div", {"class": "input-control-cabinet__hint"}
         )
         message_in_match = match.text.strip() if match else ""
+        logger.warning(f"Login failed: {message_in_match}")
         return False, f"Login failed. {message_in_match}"
 
     async def __call__(self, username, password, user_data_dir=None):
-        """Method to get Quotex API login http request.
-        :param str username: The username of a Quotex server.
-        :param str password: The password of a Quotex server.
-        :param str user_data_dir: The optional value for path userdata.
-        :returns: The instance of :class:`requests.Response`.
-        """
+        """Method to get Quotex API login http request."""
+        logger.info(f"Starting login process for user: {username}")
         data = {
             "_token": self.get_token(),
             "email": username,
             "password": password,
             "remember": 1,
         }
+        logger.debug("Login data prepared, attempting login")
         status, msg = await self._post(data)
         if not status:
-            print(msg)
+            logger.error(f"Login failed: {msg}")
             raise Exception(f"Login failed: {msg}")
 
+        logger.debug("Getting user profile after successful login")
         self.get_profile()
 
         return status, msg

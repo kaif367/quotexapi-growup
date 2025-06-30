@@ -5,11 +5,19 @@ from typing import Optional, Dict, List
 import time
 import asyncio
 import os
+import logging
 from datetime import datetime, timedelta
 import pytz
 from quotexapi.stable_api import Quotex
 from quotexapi.expiration import get_timestamp_days_ago, timestamp_to_date
 from quotexapi.config import credentials
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Get port from environment variable (Railway sets this)
 PORT = int(os.getenv("PORT", 8000))
@@ -43,6 +51,10 @@ connection_timeout = 1800  # 30 minutes
 # Timezone configuration
 ist_tz = pytz.timezone('Asia/Kolkata')
 
+# Global client instance
+client = None
+connection_lock = asyncio.Lock()
+
 def convert_to_ist(unix_timestamp):
     """Convert Unix timestamp to IST datetime string"""
     try:
@@ -53,7 +65,7 @@ def convert_to_ist(unix_timestamp):
             "ist_time": ist_dt.strftime("%Y-%m-%d %H:%M:%S IST")
         }
     except Exception as e:
-        print(f"Error converting timestamp {unix_timestamp}: {str(e)}")
+        logger.error(f"Error converting timestamp {unix_timestamp}: {str(e)}")
         return {
             "timestamp": unix_timestamp,
             "ist_time": "Invalid timestamp"
@@ -61,16 +73,20 @@ def convert_to_ist(unix_timestamp):
 
 def process_candle_data(candle: dict) -> dict:
     """Process individual candle data to add IST time"""
-    time_data = convert_to_ist(candle["time"])
-    last_tick_data = convert_to_ist(float(candle["last_tick"]))
-    
-    return {
-        **candle,
-        "time": time_data["timestamp"],
-        "time_ist": time_data["ist_time"],
-        "last_tick": last_tick_data["timestamp"],
-        "last_tick_ist": last_tick_data["ist_time"]
-    }
+    try:
+        time_data = convert_to_ist(candle["time"])
+        last_tick_data = convert_to_ist(float(candle["last_tick"]))
+        
+        return {
+            **candle,
+            "time": time_data["timestamp"],
+            "time_ist": time_data["ist_time"],
+            "last_tick": last_tick_data["timestamp"],
+            "last_tick_ist": last_tick_data["ist_time"]
+        }
+    except Exception as e:
+        logger.error(f"Error processing candle data: {str(e)}, candle: {candle}")
+        raise
 
 def should_refresh_cache(cache_entry: dict, current_time: int) -> bool:
     """Determine if cache should be refreshed based on last candle time"""
@@ -90,40 +106,94 @@ def should_refresh_cache(cache_entry: dict, current_time: int) -> bool:
     except Exception:
         return True
 
-# Get credentials
-email, password = credentials()
+async def initialize_client():
+    """Initialize and connect the Quotex client"""
+    global client
+    
+    logger.info("Starting client initialization")
+    try:
+        # Get credentials
+        email, password = credentials()
+        logger.debug(f"Got credentials for email: {email}")
+        
+        # Initialize Quotex client
+        client = Quotex(
+            email=email,
+            password=password,
+            lang="en"
+        )
+        logger.debug("Quotex client instance created")
+        
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                logger.info(f"Attempting to connect (attempt {retry_count + 1}/{max_retries})")
+                check_connect, reason = await client.connect()
+                if check_connect:
+                    logger.info("Successfully connected to Quotex")
+                    return True
+                logger.warning(f"Connection attempt {retry_count + 1} failed: {reason}")
+                retry_count += 1
+                await asyncio.sleep(5)
+            except Exception as e:
+                logger.error(f"Error during connection attempt {retry_count + 1}: {str(e)}")
+                retry_count += 1
+                await asyncio.sleep(5)
+        
+        raise Exception("Failed to establish connection after maximum retries")
+    except Exception as e:
+        logger.error(f"Error in initialize_client: {str(e)}")
+        raise
 
-# Initialize Quotex client
-client = Quotex(
-    email=email,
-    password=password,
-    lang="en"
-)
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the Quotex client on application startup"""
+    logger.info("Application startup event triggered")
+    try:
+        await initialize_client()
+    except Exception as e:
+        logger.error(f"Failed to initialize client during startup: {str(e)}")
+        # Don't exit, let the application start and retry connection when needed
 
 async def ensure_connection():
-    """Ensure connection is active and reconnect if needed"""
-    global last_connection_time, client
+    """Ensure connection is active"""
+    global client
     
-    current_time = time.time()
-    if last_connection_time is None or (current_time - last_connection_time) > connection_timeout:
-        check_connect, reason = await client.connect()
-        if not check_connect:
-            client = Quotex(email=email, password=password, lang="en")
-            check_connect, reason = await client.connect()
-            if not check_connect:
-                raise HTTPException(status_code=500, detail=f"Failed to connect: {reason}")
-        last_connection_time = current_time
+    logger.debug("Checking connection status")
+    async with connection_lock:
+        try:
+            if client is None:
+                logger.info("Client not initialized, initializing now")
+                await initialize_client()
+            else:
+                try:
+                    logger.debug("Testing existing connection")
+                    await client.get_payment()
+                    logger.debug("Connection test successful")
+                except Exception as e:
+                    logger.warning(f"Connection test failed: {str(e)}, attempting reconnection")
+                    await initialize_client()
+        except Exception as e:
+            logger.error(f"Error in ensure_connection: {str(e)}")
+            raise
 
 async def validate_asset(asset: str):
     """Validate if asset exists and is available"""
+    logger.debug(f"Validating asset: {asset}")
     try:
         asset_name, asset_data = await client.get_available_asset(asset, force_open=True)
         if not asset_data or len(asset_data) < 3:
+            logger.warning(f"Invalid asset data received for {asset}")
             raise HTTPException(status_code=400, detail=f"Invalid asset data for {asset}")
         if not asset_data[2]:
+            logger.warning(f"Asset {asset} is currently closed")
             raise HTTPException(status_code=400, detail=f"Asset {asset} is currently closed")
+        logger.debug(f"Asset {asset} validated successfully")
         return asset_name, asset_data
     except Exception as e:
+        logger.error(f"Error validating asset {asset}: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Error validating asset {asset}: {str(e)}")
 
 async def fetch_candles_batch(asset: str, end_from_time: int, offset: int, period: int, batch_size: int = 5) -> List[dict]:
